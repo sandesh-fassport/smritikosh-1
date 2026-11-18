@@ -5,7 +5,10 @@ from __future__ import annotations
 from smritikosh.indexing.strategies._helpers import build_chunk
 from smritikosh.indexing.strategies.section import (
     SectionChunkingStrategy,
+    _MarkdownBlock,
     _merge_markdown_fragments,
+    _split_markdown,
+    _token_split_block,
 )
 from tests.indexing.conftest import cap, node_for, parsed
 
@@ -439,3 +442,63 @@ class TestJsonSectionChunking:
 
         # Every chunk is labelled with the parent, not the fragment-sized keys.
         assert all(c.text.startswith("// outer\n") for c in chunks)
+
+
+def _line_count(piece: str) -> int:
+    """Lines *piece* covers; a final newline ends its last line, not a new one."""
+    return piece.count("\n") + (0 if piece.endswith("\n") else 1)
+
+
+class TestMarkdownLineRanges:
+    def test_section_ends_on_its_last_line_not_the_next_heading(self) -> None:
+        content = "# A\n\ntext\n\n# B\n\nmore\n"
+        p = parsed(content, "doc.md", "markdown")
+        headings = [
+            cap("definition.section", node_for(content, h)) for h in ("# A", "# B")
+        ]
+
+        chunks = SectionChunkingStrategy().chunk(p, headings)
+
+        assert [(c.start_line, c.end_line) for c in chunks] == [(1, 4), (5, 7)]
+
+    def test_heading_without_a_body_is_claimed_by_the_next_section(self) -> None:
+        content = "# Title\n\n## Part\n\ntext\n"
+        p = parsed(content, "doc.md", "markdown")
+        headings = [
+            cap("definition.section", node_for(content, "# Title"), key="Title"),
+            cap("definition.section", node_for(content, "## Part"), key="Part"),
+        ]
+
+        (chunk,) = SectionChunkingStrategy().chunk(p, headings)
+
+        assert (chunk.start_line, chunk.end_line) == (1, 5)
+        assert chunk.symbol == "Title > Part"
+
+    def test_only_the_first_chunk_of_a_split_section_claims_the_heading(self) -> None:
+        paragraphs = "\n\n".join(f"Paragraph {n} " + "word " * 30 for n in range(6))
+        content = f"# A\n\n{paragraphs}\n"
+        p = parsed(content, "doc.md", "markdown")
+        heading = cap("definition.section", node_for(content, "# A"), key="A")
+
+        chunks = SectionChunkingStrategy(max_chars=400).chunk(p, [heading])
+
+        assert len(chunks) > 1
+        assert chunks[0].start_line == 1
+        for previous, following in zip(chunks, chunks[1:], strict=False):
+            assert following.start_line > previous.end_line
+
+    def test_split_windows_claim_only_their_own_lines(self) -> None:
+        windows = _split_markdown("one\ntwo\nthree\nfour\n", 8)
+
+        assert len(windows) > 1
+        for piece, first, last in windows:
+            assert last - first + 1 == _line_count(piece)
+
+    def test_token_split_windows_claim_only_their_own_lines(self) -> None:
+        block = _MarkdownBlock("one\ntwo\nthree\nfour\n", 0, 3)
+
+        windows = _token_split_block(block, "", len, 8)
+
+        assert len(windows) > 1
+        for window in windows:
+            assert window.last_line - window.first_line + 1 == _line_count(window.text)
